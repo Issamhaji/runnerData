@@ -27,7 +27,6 @@ class PriceRunnerAPIClient:
     def __init__(self):
         self.browser: Optional[Browser] = None
         self.context: Optional[BrowserContext] = None
-        self.page: Optional[Page] = None
         self.playwright = None
         
     async def __aenter__(self):
@@ -72,13 +71,10 @@ class PriceRunnerAPIClient:
             });
         """)
         
-        self.page = await self.context.new_page()
         logger.info("Browser initialized successfully")
         
     async def close(self):
         """Close browser and cleanup"""
-        if self.page:
-            await self.page.close()
         if self.context:
             await self.context.close()
         if self.browser:
@@ -104,15 +100,20 @@ class PriceRunnerAPIClient:
         Returns:
             JSON response as dict or None if failed
         """
+        page = None
         try:
             logger.debug(f"Requesting: {url}")
             
+            # Create a new page for this request to avoid conflicts
+            page = await self.context.new_page()
+            
             # Navigate to URL and wait for content
-            response = await self.page.goto(url, timeout=config.BROWSER_TIMEOUT, wait_until="load")
+            response = await page.goto(url, timeout=config.BROWSER_TIMEOUT, wait_until="load")
             
             # Check status
             if response and response.status == 403:
                 logger.warning(f"403 Forbidden - may need to handle cookies/captcha")
+                await page.close()
                 return None
             
             # Wait for content to be available
@@ -121,10 +122,10 @@ class PriceRunnerAPIClient:
             # Try to get content from pre tag (API responses are typically in <pre>)
             try:
                 # Wait for pre tag to appear
-                await self.page.wait_for_selector('pre', timeout=5000, state='attached')
+                await page.wait_for_selector('pre', timeout=5000, state='attached')
                 
                 # Get the text content
-                pre_element = await self.page.query_selector('pre')
+                pre_element = await page.query_selector('pre')
                 if pre_element:
                     json_text = await pre_element.text_content()
                     
@@ -132,48 +133,64 @@ class PriceRunnerAPIClient:
                         try:
                             data = json.loads(json_text)
                             logger.debug(f"Successfully parsed JSON ({len(json_text)} chars)")
+                            await page.close()
                             return data
                         except json.JSONDecodeError as e:
                             logger.error(f"JSON decode error: {str(e)}")
                             logger.debug(f"Content preview: {json_text[:200]}")
+                            await page.close()
                             return None
                     else:
                         logger.error(f"Pre tag found but content is empty")
+                        await page.close()
                         return None
                 else:
                     logger.error(f"No pre element found")
+                    await page.close()
                     return None
                     
             except asyncio.TimeoutError:
                 # If pre tag not found, try body as fallback
                 logger.warning(f"Pre tag not found, trying body")
                 try:
-                    body_element = await self.page.query_selector('body')
+                    body_element = await page.query_selector('body')
                     if body_element:
                         json_text = await body_element.text_content()
                         if json_text and len(json_text.strip()) > 0:
                             try:
                                 data = json.loads(json_text.strip())
                                 logger.debug(f"Successfully parsed JSON from body ({len(json_text)} chars)")
+                                await page.close()
                                 return data
                             except json.JSONDecodeError as e:
                                 logger.error(f"JSON decode error from body: {str(e)}")
                                 # Log page content to understand what we're getting
-                                html = await self.page.content()
+                                html = await page.content()
                                 logger.debug(f"Page HTML preview: {html[:500]}")
+                                await page.close()
                                 return None
                         else:
                             logger.error(f"Body found but content is empty")
+                            await page.close()
                             return None
                     else:
                         logger.error(f"No body element found")
+                        await page.close()
                         return None
                 except Exception as e:
                     logger.error(f"Error reading body: {str(e)}")
+                    await page.close()
                     return None
                 
         except Exception as e:
             logger.error(f"Error making request to {url}: {str(e)}")
+            
+            # Close page if it was created
+            if page:
+                try:
+                    await page.close()
+                except:
+                    pass
             
             if retries < config.MAX_RETRIES:
                 logger.info(f"Retrying... (attempt {retries + 1}/{config.MAX_RETRIES})")
@@ -293,15 +310,19 @@ class PriceRunnerAPIClient:
         """
         logger.info("Discovering categories from homepage...")
         
+        page = None
         try:
+            # Create a dedicated page for category discovery
+            page = await self.context.new_page()
+            
             # Navigate to homepage
-            await self.page.goto(config.BASE_URL, timeout=config.BROWSER_TIMEOUT, wait_until="domcontentloaded")
+            await page.goto(config.BASE_URL, timeout=config.BROWSER_TIMEOUT, wait_until="domcontentloaded")
             await asyncio.sleep(2)  # Give page time to fully load
             
             # Accept cookies if present - try multiple selectors
             try:
                 # Try to execute JavaScript to click any cookie consent buttons
-                cookie_closed = await self.page.evaluate("""
+                cookie_closed = await page.evaluate("""
                     () => {
                         const cookieSelectors = [
                             'button[id*="cookie"]',
@@ -339,7 +360,7 @@ class PriceRunnerAPIClient:
             
             # Try to open menu to see all categories
             try:
-                menu_opened = await self.page.evaluate("""
+                menu_opened = await page.evaluate("""
                     () => {
                         // Try multiple menu button selectors
                         const menuSelectors = [
@@ -392,7 +413,7 @@ class PriceRunnerAPIClient:
             seen_ids = set()  # Track seen IDs to avoid duplicates
             
             # Use JavaScript to extract all category links
-            category_data = await self.page.evaluate("""
+            category_data = await page.evaluate("""
                 () => {
                     const links = Array.from(document.querySelectorAll('a[href*="/cl/"]'));
                     console.log('Found ' + links.length + ' category links');
@@ -445,8 +466,17 @@ class PriceRunnerAPIClient:
                     continue
             
             logger.info(f"Discovered {len(categories)} unique categories")
+            
+            # Close the page before returning
+            await page.close()
             return categories
             
         except Exception as e:
             logger.error(f"Error discovering categories: {str(e)}")
+            # Close the page if it was created
+            if page:
+                try:
+                    await page.close()
+                except:
+                    pass
             return []
